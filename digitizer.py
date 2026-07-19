@@ -1,5 +1,6 @@
 import numpy as np
 from PIL import Image
+import fitz
 
 
 def load_image(image_path):
@@ -21,6 +22,16 @@ def extract_curve(image_array, x_min=10, x_max=80):
     intensity = 1.0 - (pixel_rows / height)
 
     return two_theta, intensity
+    
+def pdf_to_image(pdf_path):
+    """Convert first page of PDF to a grayscale numpy array."""
+    doc = fitz.open(pdf_path)
+    page = doc[0]  # first page only
+    mat = fitz.Matrix(2, 2)  # 2x zoom for better resolution
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    img_array = np.frombuffer(pix.samples, dtype=np.uint8)
+    img_array = img_array.reshape(pix.height, pix.width)
+    return img_array
 
 
 def digitize_image(image_path, x_min=10, x_max=80):
