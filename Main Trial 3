@@ -1,0 +1,772 @@
+"""
+xrd_analyzer.py
+===============
+XRD PDF Analyzer — Peak Detection + Bragg's Law Calculator
+-----------------------------------------------------------
+WORKFLOW:
+  1. Load PDF → rasterize the XRD graph page
+  2. Set machine limits (2θ range, wavelength)
+  3. Extract pixel curve → convert to (2θ, Intensity) array
+  4. Detect peaks using prominence filtering
+  5. If peaks are sparse/scattered → isolate the densest peak cluster
+  6. Build a results table: Peak | 2θ | θ | d-spacing | Relative Intensity
+  7. Bragg's Law is used in Step 6 to compute d-spacing and θ
+
+Bragg's Law:
+  nλ = 2d·sin(θ)
+  → d = nλ / (2·sin(θ))
+  where:
+      n = reflection order (assumed = 1)
+      λ = X-ray wavelength in Å  (Cu-Kα = 1.54056 Å by default)
+      θ = half of the measured 2θ angle (in radians for math)
+      d = interplanar d-spacing in Å
+
+Author: Built for XRD Pattern Matcher project (MSU-IIT Ceramics)
+"""
+
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.signal import find_peaks, savgol_filter
+
+# PDF loading (PyMuPDF)
+try:
+    import fitz
+    _FITZ_OK = True
+except ImportError:
+    _FITZ_OK = False
+    print("[WARNING] PyMuPDF not found. Install with: pip install pymupdf")
+
+from PIL import Image
+
+
+# =============================================================================
+# ██████╗  ██████╗ ███╗   ██╗███████╗████████╗ █████╗ ███╗   ██╗████████╗███████╗
+# ██╔════╝ ██╔═══██╗████╗  ██║██╔════╝╚══██╔══╝██╔══██╗████╗  ██║╚══██╔══╝██╔════╝
+# ██║      ██║   ██║██╔██╗ ██║███████╗   ██║   ███████║██╔██╗ ██║   ██║   ███████╗
+# ██║      ██║   ██║██║╚██╗██║╚════██║   ██║   ██╔══██║██║╚██╗██║   ██║   ╚════██║
+# ╚██████╗ ╚██████╔╝██║ ╚████║███████║   ██║   ██║  ██║██║ ╚████║   ██║   ███████║
+#  ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝
+# =============================================================================
+# MACHINE / INSTRUMENT CONSTANTS
+# These match your BTX InXitu Portable XRD settings from the lab report.
+# Change these if a different machine or anode is used.
+# =============================================================================
+
+# X-ray wavelength in Angstroms (Å)
+# Cu-Kα radiation is the most common lab source.
+#   Cu-Kα1 = 1.54056 Å  ← used here
+#   Mo-Kα  = 0.71073 Å  (change if your machine uses Mo anode)
+WAVELENGTH_ANGSTROM = 1.54056
+
+# Bragg reflection order (almost always 1 for standard XRD)
+BRAGG_ORDER = 1
+
+# 2θ scan range from your machine settings (degrees)
+# Your BTX report says: 5° to 55°
+TWO_THETA_MIN = 5.0
+TWO_THETA_MAX = 55.0
+
+# Relative intensity cutoff — peaks below this % of max are ignored
+# Matches NIGS lab detection limit note (~5%)
+MIN_RELATIVE_INTENSITY = 5.0
+
+# Peak detection sensitivity — lower = more peaks detected
+PEAK_PROMINENCE_THRESHOLD = 0.05   # fraction of normalized intensity range
+
+# Cluster isolation: if peak density is low, isolate the region with
+# the most peaks within this sliding window (in degrees)
+CLUSTER_WINDOW_DEGREES = 15.0
+
+
+# =============================================================================
+# ██████╗ ██████╗  █████╗  ██████╗  ██████╗ ███████╗    ██╗      █████╗ ██╗    ██╗
+# ██╔══██╗██╔══██╗██╔══██╗██╔════╝ ██╔════╝ ██╔════╝    ██║     ██╔══██╗██║    ██║
+# ██████╔╝██████╔╝███████║██║  ███╗██║  ███╗███████╗    ██║     ███████║██║ █╗ ██║
+# ██╔══██╗██╔══██╗██╔══██║██║   ██║██║   ██║╚════██║    ██║     ██╔══██║██║███╗██║
+# ██████╔╝██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║    ███████╗██║  ██║╚███╔███╔╝
+# ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝    ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+# =============================================================================
+
+# =============================================================================
+#  ╔══════════════════════════════════════════════════════════════════════╗
+#  ║                      BRAGG'S LAW FUNCTIONS                          ║
+#  ║                                                                      ║
+#  ║   nλ = 2d · sin(θ)                                                  ║
+#  ║   d  = nλ / (2 · sin(θ))                                            ║
+#  ║   θ  = arcsin(nλ / 2d)                                              ║
+#  ╚══════════════════════════════════════════════════════════════════════╝
+# =============================================================================
+
+def bragg_d_spacing(two_theta_deg: float,
+                    wavelength: float = WAVELENGTH_ANGSTROM,
+                    n: int = BRAGG_ORDER) -> float:
+    """
+    ┌─────────────────────────────────────────────────────┐
+    │  BRAGG'S LAW  →  calculate d-spacing from 2θ        │
+    │                                                     │
+    │  Formula:  d = nλ / (2 · sin(θ))                   │
+    │                                                     │
+    │  Inputs:                                            │
+    │    two_theta_deg : measured 2θ angle in degrees     │
+    │    wavelength    : X-ray wavelength in Å            │
+    │    n             : reflection order (default = 1)   │
+    │                                                     │
+    │  Output:                                            │
+    │    d-spacing in Angstroms (Å)                       │
+    └─────────────────────────────────────────────────────┘
+    """
+    theta_deg = two_theta_deg / 2.0          # θ = 2θ / 2
+    theta_rad = np.radians(theta_deg)        # convert to radians for sin()
+
+    if np.sin(theta_rad) < 1e-9:
+        return np.nan                        # avoid division by zero at 2θ=0
+
+    d = (n * wavelength) / (2.0 * np.sin(theta_rad))
+    return round(d, 5)
+
+
+def bragg_theta(two_theta_deg: float) -> float:
+    """
+    ┌─────────────────────────────────────────────────────┐
+    │  BRAGG'S LAW  →  get θ (theta) from 2θ             │
+    │                                                     │
+    │  Formula:  θ = 2θ / 2                               │
+    │                                                     │
+    │  This is the Bragg angle — the angle between        │
+    │  the incident X-ray and the crystal plane.          │
+    └─────────────────────────────────────────────────────┘
+    """
+    return round(two_theta_deg / 2.0, 5)
+
+
+def bragg_two_theta_from_d(d_spacing: float,
+                            wavelength: float = WAVELENGTH_ANGSTROM,
+                            n: int = BRAGG_ORDER) -> float:
+    """
+    ┌─────────────────────────────────────────────────────┐
+    │  BRAGG'S LAW  →  calculate 2θ from known d-spacing  │
+    │                                                     │
+    │  Formula:  2θ = 2 · arcsin(nλ / 2d)               │
+    │                                                     │
+    │  Used for: generating theoretical peak positions    │
+    │  from reference database d-spacing values           │
+    └─────────────────────────────────────────────────────┘
+    """
+    ratio = (n * wavelength) / (2.0 * d_spacing)
+    if abs(ratio) > 1.0:
+        return np.nan                        # physically impossible
+    two_theta_rad = 2.0 * np.arcsin(ratio)
+    return round(np.degrees(two_theta_rad), 5)
+
+
+# =============================================================================
+# PDF → IMAGE LOADER
+# =============================================================================
+
+def load_pdf_as_image(pdf_path: str, page_index: int = 1,
+                       zoom: float = 2.5) -> np.ndarray:
+    """
+    Rasterize one page of a PDF into a grayscale numpy array.
+
+    Parameters
+    ----------
+    pdf_path   : path to the PDF file
+    page_index : which page contains the XRD graph (0-indexed, default=1
+                 because page 0 is usually the cover/methods page)
+    zoom       : render resolution multiplier (higher = more detail)
+
+    Returns
+    -------
+    np.ndarray  shape (H, W)  dtype uint8  grayscale 0-255
+    """
+    if not _FITZ_OK:
+        raise ImportError("pip install pymupdf  is required for PDF loading.")
+
+    doc  = fitz.open(pdf_path)
+    # Guard: if requested page doesn't exist, fall back to last page
+    page_index = min(page_index, len(doc) - 1)
+    page = doc[page_index]
+
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8)
+    return arr.reshape(pix.height, pix.width)
+
+
+# =============================================================================
+# CROP PLOT AREA
+# =============================================================================
+
+def crop_plot_area(arr: np.ndarray,
+                   top:    float = 0.12,
+                   bottom: float = 0.82,
+                   left:   float = 0.08,
+                   right:  float = 0.96) -> np.ndarray:
+    """
+    Remove margins, axes labels, titles, and legends.
+    Keeps only the rectangular plot region using fractional coordinates.
+
+    Tune these fractions if your PDF layout is different.
+    """
+    h, w = arr.shape
+    return arr[int(h * top) : int(h * bottom),
+               int(w * left): int(w * right)]
+
+
+# =============================================================================
+# CURVE EXTRACTION
+# =============================================================================
+
+def extract_curve(arr: np.ndarray,
+                  two_theta_min: float = TWO_THETA_MIN,
+                  two_theta_max: float = TWO_THETA_MAX) -> tuple:
+    """
+    Convert pixel array → (two_theta, intensity) arrays.
+
+    Strategy
+    --------
+    Scan each pixel column. The diffraction curve is the topmost
+    significant dark (or bright) continuous line in that column.
+
+    White-background plot  → curve is dark  → find topmost dark pixel
+    Dark-background plot   → curve is bright → find topmost bright pixel
+
+    Returns
+    -------
+    two_theta : np.ndarray  (degrees)
+    intensity : np.ndarray  (normalized 0–1)
+    """
+    h, w = arr.shape
+
+    # Detect background color from the top 15% of the image
+    top_strip   = arr[:int(h * 0.15), :]
+    white_bg    = top_strip.mean() > 128
+
+    pixel_rows = np.zeros(w, dtype=float)
+
+    for col in range(w):
+        column = arr[:, col].astype(float)
+
+        if white_bg:
+            # Dark curve on white background
+            mask = column < 180
+        else:
+            # Bright curve on dark background
+            mask = column > 80
+
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            pixel_rows[col] = h // 2        # fallback: midpoint
+        else:
+            pixel_rows[col] = idxs[0]       # topmost matching pixel
+
+    # Map pixel column → 2θ value
+    two_theta = np.linspace(two_theta_min, two_theta_max, w)
+
+    # Map pixel row → intensity  (top of image = high intensity)
+    intensity = 1.0 - (pixel_rows / h)
+    intensity = np.clip(intensity, 0.0, 1.0)
+
+    return two_theta, intensity
+
+
+# =============================================================================
+# SIGNAL SMOOTHING
+# =============================================================================
+
+def smooth_signal(y: np.ndarray,
+                  window: int = 21,
+                  poly: int   = 3) -> np.ndarray:
+    """
+    Savitzky-Golay smoothing.
+    Removes pixel noise while preserving peak shape and position.
+
+    window : must be odd; larger = smoother but may merge close peaks
+    poly   : polynomial order; 3 works well for XRD peaks
+    """
+    if len(y) < window:
+        return y
+    if window % 2 == 0:
+        window += 1
+    return savgol_filter(y, window_length=window, polyorder=poly)
+
+
+def baseline_correction(intensity: np.ndarray,
+                         window_fraction: float = 0.05) -> np.ndarray:
+    """
+    Simple rolling-minimum baseline subtraction.
+    Removes background slope so that peak intensities are comparable.
+    """
+    w = max(int(len(intensity) * window_fraction), 5)
+    baseline = np.array([
+        intensity[max(0, i - w): i + w].min()
+        for i in range(len(intensity))
+    ])
+    corrected = intensity - baseline
+    return np.clip(corrected, 0.0, None)
+
+
+# =============================================================================
+# PEAK DETECTION
+# =============================================================================
+
+def detect_peaks(two_theta: np.ndarray,
+                 intensity: np.ndarray,
+                 min_prominence: float = PEAK_PROMINENCE_THRESHOLD,
+                 min_height:     float = MIN_RELATIVE_INTENSITY / 100.0
+                 ) -> tuple:
+    """
+    Find significant peaks in the smoothed intensity curve.
+
+    Parameters
+    ----------
+    min_prominence : minimum peak prominence as fraction of intensity range
+    min_height     : minimum peak height as fraction of max intensity
+
+    Returns
+    -------
+    peak_two_theta : np.ndarray   2θ positions of detected peaks
+    peak_intensity : np.ndarray   intensity values at those peaks
+    peak_indices   : np.ndarray   array indices (for internal use)
+    """
+    # Normalize to 0-1 for consistent thresholding
+    norm = intensity / (intensity.max() + 1e-9)
+
+    indices, props = find_peaks(
+        norm,
+        prominence=min_prominence,
+        height=min_height,
+        distance=5                  # minimum 5 pixels apart
+    )
+
+    return two_theta[indices], intensity[indices], indices
+
+
+# =============================================================================
+# CLUSTER ISOLATION
+# =============================================================================
+
+def isolate_peak_cluster(peak_two_theta: np.ndarray,
+                          peak_intensity: np.ndarray,
+                          two_theta_full: np.ndarray,
+                          intensity_full: np.ndarray,
+                          window_deg: float = CLUSTER_WINDOW_DEGREES
+                          ) -> tuple:
+    """
+    If peaks are scattered across the whole 2θ range, find the region
+    with the highest peak density and return just that window.
+
+    This implements step 3 of the pseudocode:
+      'If peaks are scattered, get (isolate) parts with many peaks'
+
+    Algorithm
+    ---------
+    Slide a window of width *window_deg* across the 2θ range.
+    Count peaks inside each window position.
+    Return the window with the most peaks.
+
+    Returns
+    -------
+    tt_window    : 2θ array for the dense region
+    int_window   : intensity array for the dense region
+    window_start : start of the region (degrees)
+    window_end   : end of the region (degrees)
+    """
+    if len(peak_two_theta) == 0:
+        return two_theta_full, intensity_full, two_theta_full[0], two_theta_full[-1]
+
+    tt_min = two_theta_full[0]
+    tt_max = two_theta_full[-1]
+
+    best_count  = 0
+    best_start  = tt_min
+    best_end    = tt_min + window_deg
+
+    # Slide window in 1° steps
+    step = 1.0
+    pos  = tt_min
+    while pos + window_deg <= tt_max:
+        mask  = (peak_two_theta >= pos) & (peak_two_theta < pos + window_deg)
+        count = mask.sum()
+        if count > best_count:
+            best_count = count
+            best_start = pos
+            best_end   = pos + window_deg
+        pos += step
+
+    # Extract the full curve in that window
+    mask_full   = (two_theta_full >= best_start) & (two_theta_full <= best_end)
+    tt_window   = two_theta_full[mask_full]
+    int_window  = intensity_full[mask_full]
+
+    return tt_window, int_window, best_start, best_end
+
+
+# =============================================================================
+# BRAGG TABLE BUILDER
+# =============================================================================
+
+def build_peak_table(peak_two_theta: np.ndarray,
+                     peak_intensity: np.ndarray,
+                     wavelength:     float = WAVELENGTH_ANGSTROM,
+                     n:              int   = BRAGG_ORDER) -> pd.DataFrame:
+    """
+    Step 4–6 of pseudocode:
+      Convert peaks into a table with columns computed via Bragg's Law.
+
+    Columns
+    -------
+    Peak          : peak number (1-indexed, sorted by 2θ)
+    2θ (°)        : measured two-theta angle
+    θ (°)         : Bragg angle  ← BRAGG'S LAW: θ = 2θ / 2
+    d-spacing (Å) : interplanar spacing ← BRAGG'S LAW: d = nλ / (2·sin(θ))
+    Rel. Intensity : intensity as % of the strongest peak (= 100)
+    """
+    if len(peak_two_theta) == 0:
+        return pd.DataFrame()
+
+    # Sort by 2θ position
+    order      = np.argsort(peak_two_theta)
+    sorted_tt  = peak_two_theta[order]
+    sorted_int = peak_intensity[order]
+
+    # Relative intensity: normalize so the strongest peak = 100
+    max_int    = sorted_int.max()
+    rel_int    = (sorted_int / max_int * 100.0).round(1)
+
+    rows = []
+    for i, (tt, ri) in enumerate(zip(sorted_tt, rel_int), start=1):
+        # ── BRAGG'S LAW applied here ─────────────────────────
+        theta     = bragg_theta(tt)                      # θ = 2θ/2
+        d_spacing = bragg_d_spacing(tt, wavelength, n)  # d = nλ/(2sinθ)
+        # ─────────────────────────────────────────────────────
+
+        rows.append({
+            "Peak":            i,
+            "2θ (°)":          round(tt, 3),
+            "θ (°)":           theta,        # ← from bragg_theta()
+            "d-spacing (Å)":   d_spacing,    # ← from bragg_d_spacing()
+            "Rel. Intensity":  ri,
+        })
+
+    df = pd.DataFrame(rows)
+    df = df.set_index("Peak")
+    return df
+
+
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def plot_results(two_theta:     np.ndarray,
+                 intensity:     np.ndarray,
+                 peak_tt:       np.ndarray,
+                 peak_int:      np.ndarray,
+                 df_table:      pd.DataFrame,
+                 cluster_range: tuple = None,
+                 title:         str   = "XRD Pattern Analysis"):
+    """
+    Three-panel figure:
+      Top    : full diffractogram with detected peaks marked
+      Middle : zoomed cluster region (if isolated)
+      Bottom : Bragg table as a rendered grid
+    """
+    n_panels = 3 if (cluster_range and cluster_range[0] != two_theta[0]) else 2
+
+    fig = plt.figure(figsize=(14, 10))
+    fig.patch.set_facecolor("#0f1117")
+    fig.suptitle(title, color="#e2e8f0", fontsize=14, fontweight="bold", y=0.98)
+
+    gs = gridspec.GridSpec(n_panels, 1, figure=fig,
+                           hspace=0.45,
+                           height_ratios=[3, 2, 2.5] if n_panels == 3 else [3, 2.5])
+
+    PLOT_BG = "#12151f"
+    BORDER  = "#2a2d3e"
+    ACCENT  = "#6366f1"
+    GOLD    = "#f59e0b"
+    TEXT    = "#e2e8f0"
+    SUB     = "#64748b"
+
+    def _style(ax):
+        ax.set_facecolor(PLOT_BG)
+        ax.tick_params(colors=SUB, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color(BORDER)
+        ax.set_xlabel("2θ (degrees)", color=SUB, fontsize=9)
+        ax.set_ylabel("Relative Intensity", color=SUB, fontsize=9)
+        ax.grid(True, color=BORDER, linewidth=0.4, alpha=0.6)
+
+    # ── Panel 1: Full diffractogram ───────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0])
+    _style(ax1)
+    ax1.set_title("Full Diffractogram", color=TEXT, fontsize=10, pad=4)
+    ax1.plot(two_theta, intensity, color=ACCENT, linewidth=1.2, alpha=0.9)
+    ax1.fill_between(two_theta, intensity, alpha=0.10, color=ACCENT)
+
+    # Mark detected peaks
+    for tt, ii in zip(peak_tt, peak_int):
+        ax1.axvline(tt, color=GOLD, linewidth=0.8, alpha=0.5, linestyle="--")
+        ax1.annotate(f"{tt:.2f}°",
+                     xy=(tt, ii),
+                     xytext=(0, 6), textcoords="offset points",
+                     ha="center", fontsize=5.5, color=GOLD, rotation=90)
+
+    # Draw cluster region box if applicable
+    if cluster_range and n_panels == 3:
+        ax1.axvspan(cluster_range[0], cluster_range[1],
+                    alpha=0.08, color=GOLD, label=f"Dense cluster")
+        ax1.legend(fontsize=7, labelcolor=TEXT,
+                   facecolor=PLOT_BG, edgecolor=BORDER)
+
+    # ── Panel 2 (optional): Zoomed cluster ───────────────────────────────────
+    panel_idx = 1
+    if n_panels == 3 and cluster_range:
+        ax2 = fig.add_subplot(gs[1])
+        _style(ax2)
+        ax2.set_title(
+            f"Dense Peak Region  ({cluster_range[0]:.1f}° – {cluster_range[1]:.1f}°)",
+            color=TEXT, fontsize=10, pad=4)
+
+        mask = ((two_theta >= cluster_range[0]) &
+                (two_theta <= cluster_range[1]))
+        ax2.plot(two_theta[mask], intensity[mask],
+                 color=GOLD, linewidth=1.4)
+        ax2.fill_between(two_theta[mask], intensity[mask],
+                         alpha=0.12, color=GOLD)
+
+        cl_peaks = ((peak_tt >= cluster_range[0]) &
+                    (peak_tt <= cluster_range[1]))
+        for tt, ii in zip(peak_tt[cl_peaks], peak_int[cl_peaks]):
+            ax2.axvline(tt, color=ACCENT, linewidth=0.9,
+                        alpha=0.6, linestyle="--")
+            ax2.annotate(f"{tt:.2f}°",
+                         xy=(tt, ii),
+                         xytext=(0, 6), textcoords="offset points",
+                         ha="center", fontsize=6, color=ACCENT, rotation=90)
+        panel_idx = 2
+
+    # ── Panel 3: Bragg table ──────────────────────────────────────────────────
+    ax_tbl = fig.add_subplot(gs[panel_idx])
+    ax_tbl.axis("off")
+    ax_tbl.set_title(
+        f"Bragg's Law Table  (λ = {WAVELENGTH_ANGSTROM} Å, n = {BRAGG_ORDER})",
+        color=TEXT, fontsize=10, pad=4)
+
+    if not df_table.empty:
+        col_labels = ["2θ (°)", "θ (°)", "d-spacing (Å)", "Rel. Intensity"]
+        cell_data  = df_table.reset_index()[
+            ["Peak", "2θ (°)", "θ (°)", "d-spacing (Å)", "Rel. Intensity"]
+        ].values.tolist()
+
+        tbl = ax_tbl.table(
+            cellText   = cell_data,
+            colLabels  = ["Peak", "2θ (°)", "θ (°)", "d-spacing (Å)", "Rel. Int. (%)"],
+            cellLoc    = "center",
+            loc        = "center",
+            bbox       = [0.0, 0.0, 1.0, 1.0]
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8.5)
+
+        # Style header row
+        for (r, c), cell in tbl.get_celld().items():
+            cell.set_edgecolor(BORDER)
+            if r == 0:
+                cell.set_facecolor("#1e2130")
+                cell.set_text_props(color=GOLD, fontweight="bold")
+            else:
+                cell.set_facecolor(PLOT_BG if r % 2 == 0 else "#1a1d27")
+                cell.set_text_props(color=TEXT)
+    else:
+        ax_tbl.text(0.5, 0.5, "No peaks detected — adjust thresholds.",
+                    ha="center", va="center",
+                    transform=ax_tbl.transAxes,
+                    color=SUB, fontsize=10)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+
+# =============================================================================
+# PRINT TABLE TO CONSOLE
+# =============================================================================
+
+def print_peak_table(df: pd.DataFrame):
+    """Print the Bragg table to the terminal in a readable format."""
+    if df.empty:
+        print("No peaks detected.")
+        return
+
+    print()
+    print("=" * 65)
+    print(f"  BRAGG'S LAW PEAK TABLE   (λ = {WAVELENGTH_ANGSTROM} Å, n = {BRAGG_ORDER})")
+    print(f"  Formula: d = nλ / (2·sin(θ))     θ = 2θ / 2")
+    print("=" * 65)
+    print(f"  {'Peak':>4}  {'2θ (°)':>9}  {'θ (°)':>8}  "
+          f"{'d-spacing (Å)':>14}  {'Rel. Int. (%)':>14}")
+    print("  " + "-" * 60)
+    for idx, row in df.iterrows():
+        print(f"  {idx:>4}  {row['2θ (°)']:>9.3f}  {row['θ (°)']:>8.3f}  "
+              f"{row['d-spacing (Å)']:>14.5f}  {row['Rel. Intensity']:>14.1f}")
+    print("=" * 65)
+    print()
+
+
+# =============================================================================
+# SAVE TABLE TO CSV
+# =============================================================================
+
+def save_table_csv(df: pd.DataFrame, out_path: str = "xrd_peaks.csv"):
+    """Export the Bragg table to a CSV file."""
+    if df.empty:
+        print("Nothing to save — table is empty.")
+        return
+    df.to_csv(out_path)
+    print(f"Peak table saved to: {out_path}")
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def analyze_xrd_pdf(pdf_path:       str,
+                    page_index:     int   = 1,
+                    two_theta_min:  float = TWO_THETA_MIN,
+                    two_theta_max:  float = TWO_THETA_MAX,
+                    wavelength:     float = WAVELENGTH_ANGSTROM,
+                    show_plot:      bool  = True,
+                    save_csv:       bool  = True,
+                    csv_path:       str   = "xrd_peaks.csv") -> pd.DataFrame:
+    """
+    Full pipeline — call this function to analyze an XRD PDF.
+
+    Parameters
+    ----------
+    pdf_path      : path to your XRD lab report PDF
+    page_index    : page number containing the XRD graph (0-indexed)
+    two_theta_min : minimum 2θ from machine settings
+    two_theta_max : maximum 2θ from machine settings
+    wavelength    : X-ray wavelength in Å (default Cu-Kα = 1.54056)
+    show_plot     : whether to display the matplotlib figure
+    save_csv      : whether to export the table to CSV
+    csv_path      : output CSV filename
+
+    Returns
+    -------
+    pd.DataFrame  : the Bragg peak table
+    """
+
+    print(f"\n{'─'*55}")
+    print(f"  XRD Analyzer  |  {pdf_path}")
+    print(f"  2θ range : {two_theta_min}° – {two_theta_max}°")
+    print(f"  λ        : {wavelength} Å  (n={BRAGG_ORDER})")
+    print(f"{'─'*55}\n")
+
+    # ── Step 1: Load PDF page as image ────────────────────────────────────────
+    print("[1] Loading PDF...")
+    raw_arr = load_pdf_as_image(pdf_path, page_index=page_index)
+
+    # ── Step 2: Crop to plot area only ────────────────────────────────────────
+    print("[2] Cropping plot area...")
+    cropped = crop_plot_area(raw_arr)
+
+    # ── Step 3: Extract curve pixels → (2θ, intensity) ───────────────────────
+    print("[3] Extracting diffraction curve...")
+    two_theta, intensity = extract_curve(cropped, two_theta_min, two_theta_max)
+
+    # ── Step 4: Smooth + baseline correction ──────────────────────────────────
+    print("[4] Smoothing signal + baseline correction...")
+    intensity = smooth_signal(intensity, window=21)
+    intensity = baseline_correction(intensity)
+
+    # Renormalize after correction
+    if intensity.max() > 0:
+        intensity = intensity / intensity.max()
+
+    # ── Step 5: Detect peaks ──────────────────────────────────────────────────
+    print("[5] Detecting peaks...")
+    peak_tt, peak_int, _ = detect_peaks(two_theta, intensity)
+    print(f"    → {len(peak_tt)} peaks detected.")
+
+    # ── Step 6: Isolate dense cluster if peaks are scattered ──────────────────
+    cluster_range = None
+    if len(peak_tt) > 3:
+        span = peak_tt[-1] - peak_tt[0] if len(peak_tt) > 1 else 0
+        density = len(peak_tt) / (span + 1e-3)
+
+        if density < 0.5:           # sparse: fewer than 1 peak per 2°
+            print("[6] Peaks are scattered — isolating dense cluster...")
+            _, _, c_start, c_end = isolate_peak_cluster(
+                peak_tt, peak_int, two_theta, intensity)
+            cluster_range = (c_start, c_end)
+            print(f"    → Dense region: {c_start:.1f}° – {c_end:.1f}°")
+
+            # Re-detect peaks within the cluster only
+            mask     = (two_theta >= c_start) & (two_theta <= c_end)
+            peak_tt, peak_int, _ = detect_peaks(
+                two_theta[mask], intensity[mask])
+        else:
+            print("[6] Peak distribution OK — no cluster isolation needed.")
+    else:
+        print("[6] Too few peaks for cluster analysis.")
+
+    # ── Step 7: Build Bragg table ─────────────────────────────────────────────
+    print("[7] Building Bragg's Law table...")
+    print(f"    Formula: d = nλ / (2·sin(θ))  where λ={wavelength} Å, n={BRAGG_ORDER}")
+    df = build_peak_table(peak_tt, peak_int, wavelength=wavelength)
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    print_peak_table(df)
+
+    if save_csv:
+        save_table_csv(df, csv_path)
+
+    if show_plot:
+        plot_results(
+            two_theta, intensity,
+            peak_tt, peak_int,
+            df,
+            cluster_range=cluster_range,
+            title=f"XRD Analysis  |  λ={wavelength} Å  |  "
+                  f"2θ: {two_theta_min}°–{two_theta_max}°"
+        )
+
+    return df
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    # ── USAGE: python xrd_analyzer.py your_xrd_report.pdf ────────────────────
+    #
+    # You can also change these defaults directly:
+    #   TWO_THETA_MIN / TWO_THETA_MAX at the top of this file
+    #   WAVELENGTH_ANGSTROM for a different X-ray source
+    #   MIN_RELATIVE_INTENSITY for detection sensitivity
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("Usage: python xrd_analyzer.py <path_to_xrd.pdf> [page_index]")
+        print("       page_index defaults to 1 (second page, where graph usually is)")
+        sys.exit(0)
+
+    pdf_file   = sys.argv[1]
+    page_no    = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+
+    result_df  = analyze_xrd_pdf(
+        pdf_path      = pdf_file,
+        page_index    = page_no,
+        two_theta_min = TWO_THETA_MIN,
+        two_theta_max = TWO_THETA_MAX,
+        wavelength    = WAVELENGTH_ANGSTROM,
+        show_plot     = True,
+        save_csv      = True,
+        csv_path      = "xrd_peaks.csv"
+    )
